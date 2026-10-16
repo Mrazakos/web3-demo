@@ -1,15 +1,5 @@
-import { ethers } from "ethers";
-import { CONTRACT_ADDRESS, CONTRACT_ABI } from "./contractData.js";
-
-const HARDHAT_CHAIN_ID = 31337n;
-const HARDHAT_CHAIN_HEX = "0x7a69";
-
-// State
-let provider = null;
-let signer = null;
-let contract = null;
-let currentAccount = null;
-let isCorrectNetwork = false;
+import { web3Service } from "./web3Service.js";
+import { storageService, CONTRACT_ADDRESS } from "./storageService.js";
 
 // DOM Elements
 const connectBtn = document.getElementById("connectBtn");
@@ -25,21 +15,14 @@ const contractAddressDisplay = document.getElementById("contractAddressDisplay")
 const walletAddressDisplay = document.getElementById("walletAddressDisplay");
 const walletBalanceDisplay = document.getElementById("walletBalanceDisplay");
 
-// Helper: truncate address
+// Helper: truncate 0x1234...5678
 function formatAddress(address) {
   if (!address) return "--";
   return `${address.substring(0, 6)}...${address.substring(address.length - 4)}`;
 }
 
-// Display contract address
-if (contractAddressDisplay) {
-  contractAddressDisplay.textContent = formatAddress(CONTRACT_ADDRESS);
-  contractAddressDisplay.title = CONTRACT_ADDRESS;
-}
-
-// Helper: set status message
+// Helper: update status text
 function setStatus(text, type = "normal") {
-  if (!statusMessage) return;
   if (!text) {
     statusMessage.textContent = "";
     statusMessage.className = "status hidden";
@@ -50,108 +33,18 @@ function setStatus(text, type = "normal") {
   statusMessage.classList.remove("hidden");
 }
 
-// Check MetaMask availability
-function hasMetaMask() {
-  return typeof window !== "undefined" && Boolean(window.ethereum);
+// Display contract address on page load
+if (contractAddressDisplay) {
+  contractAddressDisplay.textContent = formatAddress(CONTRACT_ADDRESS);
+  contractAddressDisplay.title = CONTRACT_ADDRESS;
 }
 
-// Initialize application
-async function init() {
-  if (!hasMetaMask()) {
-    connectBtn.textContent = "MetaMask not found";
-    connectBtn.onclick = () => window.open("https://metamask.io/download/", "_blank");
-    return;
-  }
-
-  provider = new ethers.BrowserProvider(window.ethereum);
-
-  await checkNetwork();
-
-  try {
-    const accounts = await provider.send("eth_accounts", []);
-    if (accounts.length > 0) {
-      await handleAccountsChanged(accounts);
-    } else {
-      // Wallet not connected yet, but try reading via local provider
-      await readStoredValue();
-    }
-  } catch (err) {
-    console.error("Auto-connect check failed:", err);
-  }
-
-  window.ethereum.on("accountsChanged", handleAccountsChanged);
-  window.ethereum.on("chainChanged", () => window.location.reload());
-}
-
-// Check network
-async function checkNetwork() {
-  if (!provider) return;
-  try {
-    const network = await provider.getNetwork();
-    if (network.chainId === HARDHAT_CHAIN_ID) {
-      isCorrectNetwork = true;
-      networkWarning.classList.add("hidden");
-    } else {
-      isCorrectNetwork = false;
-      networkWarning.classList.remove("hidden");
-    }
-  } catch (err) {
-    console.error("Network check failed:", err);
-  }
-}
-
-// Switch to Hardhat Localhost
-async function switchNetwork() {
-  try {
-    await window.ethereum.request({
-      method: "wallet_switchEthereumChain",
-      params: [{ chainId: HARDHAT_CHAIN_HEX }],
-    });
-  } catch (err) {
-    if (err.code === 4902) {
-      try {
-        await window.ethereum.request({
-          method: "wallet_addEthereumChain",
-          params: [
-            {
-              chainId: HARDHAT_CHAIN_HEX,
-              chainName: "Hardhat Localhost",
-              rpcUrls: ["http://127.0.0.1:8545"],
-              nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-            },
-          ],
-        });
-      } catch (addErr) {
-        console.error("Failed to add network:", addErr);
-      }
-    } else {
-      console.error("Failed to switch network:", err);
-    }
-  }
-}
-
-// Connect MetaMask
-async function connectWallet() {
-  if (!hasMetaMask()) return;
-  try {
-    connectBtn.disabled = true;
-    connectBtn.textContent = "Connecting...";
-    const accounts = await provider.send("eth_requestAccounts", []);
-    await handleAccountsChanged(accounts);
-  } catch (err) {
-    console.error("Connection failed:", err);
-    setStatus("Failed to connect wallet", "error");
-  } finally {
-    connectBtn.disabled = false;
-  }
-}
-
-// Handle account change
-async function handleAccountsChanged(accounts) {
-  if (accounts.length === 0) {
-    currentAccount = null;
-    signer = null;
-    contract = null;
+/**
+ * Synchronize UI state with current wallet & network status
+ */
+async function syncUI(account) {
+  if (!account) {
+    storageService.init(null);
     walletAddressDisplay.textContent = "Not Connected";
     walletBalanceDisplay.textContent = "--";
     connectBtn.textContent = "Connect Wallet";
@@ -159,109 +52,126 @@ async function handleAccountsChanged(accounts) {
     return;
   }
 
-  currentAccount = accounts[0];
-  signer = await provider.getSigner();
+  // Wallet Connected
+  walletAddressDisplay.textContent = formatAddress(account);
+  walletAddressDisplay.title = account;
+  connectBtn.textContent = formatAddress(account);
 
-  walletAddressDisplay.textContent = formatAddress(currentAccount);
-  walletAddressDisplay.title = currentAccount;
-  connectBtn.textContent = formatAddress(currentAccount);
+  // Initialize storage contract with the active signer
+  storageService.init(web3Service.getSigner());
 
-  await updateBalance();
-  await checkNetwork();
+  const balance = await web3Service.getBalance();
+  walletBalanceDisplay.textContent = `${balance} ETH`;
 
-  contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-  submitBtn.disabled = !isCorrectNetwork;
+  const isCorrect = await web3Service.isCorrectNetwork();
+  networkWarning.classList.toggle("hidden", isCorrect);
+  submitBtn.disabled = !isCorrect;
 
-  await readStoredValue();
-  setupEventListener();
+  // Read stored value and attach event listener
+  await refreshStoredValue();
+  storageService.onValueUpdated(({ newValue }) => {
+    storedValueDisplay.textContent = newValue;
+  });
 }
 
-// Update balance
-async function updateBalance() {
-  if (!currentAccount || !provider) return;
-  try {
-    const balance = await provider.getBalance(currentAccount);
-    walletBalanceDisplay.textContent = `${parseFloat(ethers.formatEther(balance)).toFixed(4)} ETH`;
-  } catch (err) {
-    console.error("Balance fetch error:", err);
-  }
-}
-
-// Read value from contract
-async function readStoredValue() {
+/**
+ * Read value from smart contract via StorageService
+ */
+async function refreshStoredValue() {
   storedValueDisplay.textContent = "Loading...";
-
   try {
-    if (contract) {
-      const val = await contract.get();
-      storedValueDisplay.textContent = val;
-    } else {
-      // Direct JSON-RPC fallback if wallet not yet connected
-      const readProvider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
-      const readContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, readProvider);
-      const val = await readContract.get();
-      storedValueDisplay.textContent = val;
-    }
+    const val = await storageService.getStoredValue();
+    storedValueDisplay.textContent = val;
   } catch (err) {
-    console.warn("Read error (node may be offline):", err.message);
+    console.warn("Could not read stored value:", err.message);
     storedValueDisplay.textContent = "--";
   }
 }
 
-// Update value on blockchain
-async function updateStoredValue(e) {
+/**
+ * Handle form submit (contract.set via StorageService)
+ */
+async function handleUpdateSubmit(e) {
   e.preventDefault();
 
   const newValue = newValueInput.value.trim();
   if (!newValue) return;
 
-  if (!contract || !signer) {
-    setStatus("Please connect your wallet first.", "error");
-    return;
-  }
-
   try {
     submitBtn.disabled = true;
     submitBtn.textContent = "Saving...";
-    setStatus("Confirm transaction in MetaMask...", "normal");
 
-    const tx = await contract.set(newValue);
-    setStatus(`Transaction sent (${formatAddress(tx.hash)}). Mining...`, "normal");
+    await storageService.setStoredValue(newValue, (progress) => {
+      setStatus(progress, "normal");
+    });
 
-    await tx.wait(1);
     setStatus("Saved successfully to blockchain.", "success");
     newValueInput.value = "";
 
-    await readStoredValue();
-    await updateBalance();
+    await refreshStoredValue();
+    const updatedBalance = await web3Service.getBalance();
+    walletBalanceDisplay.textContent = `${updatedBalance} ETH`;
   } catch (err) {
-    console.error("Update error:", err);
-    setStatus(err.reason || err.message || "Transaction rejected", "error");
+    console.error("Update failed:", err);
+    setStatus(err.reason || err.message || "Transaction cancelled", "error");
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = "Save";
   }
 }
 
-// Real-time event listener
-let isListening = false;
-function setupEventListener() {
-  if (!contract || isListening) return;
-
-  try {
-    contract.on("ValueUpdated", (_updater, newValue) => {
-      storedValueDisplay.textContent = newValue;
-    });
-    isListening = true;
-  } catch (err) {
-    console.error("Event listener error:", err);
+/**
+ * Initialize application
+ */
+async function init() {
+  if (!web3Service.hasMetaMask()) {
+    connectBtn.textContent = "MetaMask not found";
+    connectBtn.onclick = () => window.open("https://metamask.io/download/", "_blank");
+    return;
   }
+
+  web3Service.initProvider();
+
+  // Check existing connection on load
+  const existingAccount = await web3Service.checkExistingConnection();
+  if (existingAccount) {
+    await syncUI(existingAccount);
+  } else {
+    // Attempt fallback read even before wallet is connected
+    await refreshStoredValue();
+  }
+
+  // Listen to MetaMask account / chain changes
+  web3Service.onAccountsChanged(async (account) => {
+    await syncUI(account);
+  });
+
+  web3Service.onChainChanged(() => {
+    window.location.reload();
+  });
+
+  // Attach UI listeners
+  connectBtn.addEventListener("click", async () => {
+    try {
+      const account = await web3Service.connectWallet();
+      await syncUI(account);
+    } catch (err) {
+      console.error("Connect failed:", err);
+      setStatus("Failed to connect wallet", "error");
+    }
+  });
+
+  switchNetworkBtn.addEventListener("click", async () => {
+    try {
+      await web3Service.switchToHardhatNetwork();
+    } catch (err) {
+      console.error("Switch network failed:", err);
+    }
+  });
+
+  refreshBtn.addEventListener("click", refreshStoredValue);
+  updateForm.addEventListener("submit", handleUpdateSubmit);
 }
 
-// Bind events
-connectBtn.addEventListener("click", connectWallet);
-switchNetworkBtn.addEventListener("click", switchNetwork);
-refreshBtn.addEventListener("click", readStoredValue);
-updateForm.addEventListener("submit", updateStoredValue);
-
+// Start app
 init();
